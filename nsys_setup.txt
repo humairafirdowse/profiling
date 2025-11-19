@@ -1,0 +1,24 @@
+sudo apt update
+sudo apt install -y gnupg software-properties-common
+
+# Add NVIDIA devtools repo key
+sudo apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub
+
+# Add Nsight Systems devtools repo
+echo "deb https://developer.download.nvidia.com/devtools/repos/ubuntu$(source /etc/lsb-release; echo "$DISTRIB_RELEASE" | tr -d .)/$(dpkg --print-architecture)/ /" \ | sudo tee /etc/apt/sources.list.d/nvidia-devtools.list
+
+sudo apt update
+
+# Full GUI + CLI:
+sudo apt install -y nsight-systems
+
+
+nsys profile \
+  -o matmul_allreduce_2gpu \
+  --trace=cuda,nvtx,osrt \
+  torchrun --nproc_per_node=2 matmul_reduce.py
+
+nsys export \
+  --type sqlite \
+  --output=myprofile_sqlite \
+  matmul_allreduce_2gpu.nsys-rep
