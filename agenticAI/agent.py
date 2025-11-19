@@ -114,7 +114,7 @@ Always be careful with file operations and verify before making destructive chan
         self.conversation_history.append({"role": "user", "content": task})
         
         while iterations < max_iterations:
-            iterations += 1
+            iterations+=1
             
             if config.agent.verbose:
                 print(f"\n[Iteration {iterations}/{max_iterations}]")
@@ -132,9 +132,7 @@ Always be careful with file operations and verify before making destructive chan
                 )
                 
                 # Add assistant response to history
-                self.conversation_history.append({"role": "assistant", "content": response.content})
-                
-                # Generate actions from response
+                self.conversation_history.append({"role": "assistant", "content": response.content})                # Generate actions from response
                 actions = self.action_generator.generate_from_llm_response(response)
                 
                 if not actions:

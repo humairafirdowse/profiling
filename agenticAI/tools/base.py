@@ -36,12 +36,16 @@ class Tool(BaseModel, ABC):
         required = []
         
         for param in self.parameters:
-            properties[param.name] = {
+            param_schema = {
                 "type": param.type,
                 "description": param.description
             }
+            # For array types, add items property (required by JSON Schema)
+            if param.type == "array":
+                param_schema["items"] = {"type": "string"}
             if param.default is not None:
-                properties[param.name]["default"] = param.default
+                param_schema["default"] = param.default
+            properties[param.name] = param_schema
             if param.required:
                 required.append(param.name)
         

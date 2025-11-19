@@ -40,7 +40,6 @@ class OpenAIProvider(LLMProvider):
                 function_call = {"name": tool_choice}
             else:
                 function_call = "auto"
-        
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -50,7 +49,6 @@ class OpenAIProvider(LLMProvider):
                 functions=functions,
                 function_call=function_call
             )
-            
             message = response.choices[0].message
             content = message.content or ""
             
