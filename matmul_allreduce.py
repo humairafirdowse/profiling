@@ -1,153 +1,179 @@
-#!/usr/bin/env python3
-"""
-Script to demonstrate:
-1. Fire matmul (a) using FlashAttention
-2. When a finishes, fire another matmul (b) and simultaneously 
-   fire an all-reduce operation (2 GPU) in another CUDA stream
-"""
-
+import os
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
-from torch.cuda import Stream
 import time
-import os
 
-# Try to import flash attention, fallback to regular attention if not available
-try:
-    from flash_attn import flash_attn_func
-    FLASH_ATTN_AVAILABLE = True
-    print("✓ Flash Attention available")
-except ImportError:
-    FLASH_ATTN_AVAILABLE = False
-    print("⚠ Flash Attention not available, using standard attention")
+def setup():
+    """Initialize the distributed environment."""
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    torch.cuda.set_device(rank)
+    return rank, world_size
 
-def setup_distributed():
-    """Setup distributed environment for 2 GPUs"""
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        rank = int(os.environ['RANK'])
-        world_size = int(os.environ['WORLD_SIZE'])
-        local_rank = int(os.environ['LOCAL_RANK'])
-    else:
-        # Fallback: use single process with 2 GPUs
-        rank = 0
-        world_size = 1
-        local_rank = 0
-        print("⚠ Running in single-process mode. For true 2-GPU all-reduce, use:")
-        print("  torchrun --nproc_per_node=2 matmul_allreduce.py")
-    
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f'cuda:{local_rank}')
-    else:
-        device = torch.device('cpu')
-        print("⚠ CUDA not available, using CPU")
-    
-    # Initialize process group if distributed
-    if world_size > 1:
-        dist.init_process_group(
-            backend='nccl',
-            init_method='env://',
-            world_size=world_size,
-            rank=rank
-        )
-    
-    return device, rank, world_size
+def cleanup():
+    """Clean up the distributed environment."""
+    dist.destroy_process_group()
 
-def flash_attention_matmul(q, k, v):
-    """Perform matmul using Flash Attention"""
-    if FLASH_ATTN_AVAILABLE:
-        # Flash attention expects (batch, seq_len, num_heads, head_dim)
-        # and returns (batch, seq_len, num_heads, head_dim)
-        return flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False)
-    else:
-        # Fallback to standard scaled dot-product attention
-        scale = (q.size(-1)) ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn = F.softmax(attn, dim=-1)
-        return torch.matmul(attn, v)
 
-def main():
-    device, rank, world_size = setup_distributed()
+# ============================================================================
+# Example 1: NO OVERLAP - Sequential Compute then Communication
+# ============================================================================
+def no_overlap_matmul(rank, world_size, size=4096):
+    """
+    Computation and communication happen sequentially - no overlap.
+    Pattern: Compute -> Wait -> Communicate -> Wait
+    """
+    # setup() was already called in main()
+
+    # Create matrices on each GPU
+    A = torch.randn(size, size, device=f'cuda:{rank}')
+    B = torch.randn(size, size, device=f'cuda:{rank}')
     
-    # Create CUDA streams
-    default_stream = torch.cuda.current_stream()
-    matmul_stream = Stream()
-    allreduce_stream = Stream()
+    print(f"[Rank {rank}] Starting NO OVERLAP example...")
+    start = time.time()
     
-    print(f"\n{'='*60}")
-    print(f"Device: {device}, Rank: {rank}, World Size: {world_size}")
-    print(f"{'='*60}\n")
+    # Step 1: Do ALL computation first (blocking)
+    print(f"[Rank {rank}] Computing matmul...")
+    C = torch.matmul(A, B)
+    torch.cuda.synchronize()  # Wait for computation to finish
     
-    # Parameters for matmuls
-    batch_size = 2
-    seq_len = 2048
-    num_heads = 8
-    head_dim = 64
-    hidden_dim = num_heads * head_dim
+    # Step 2: Then do communication (blocking)
+    print(f"[Rank {rank}] Starting communication...")
+    dist.all_reduce(C, op=dist.ReduceOp.SUM)
+    torch.cuda.synchronize()  # Wait for communication to finish
     
-    # Create tensors for matmul (a) - FlashAttention
-    print("Creating tensors for matmul (a) - FlashAttention...")
-    q_a = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float16)
-    k_a = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float16)
-    v_a = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float16)
+    end = time.time()
+    print(f"[Rank {rank}] NO OVERLAP completed in {end-start:.3f}s")
     
-    # Synchronize before starting
+    return C
+
+
+# ============================================================================
+# Example 2: WITH OVERLAP - Interleaved Compute and Communication
+# ============================================================================
+
+def overlap_matmul(rank, world_size, size=4096, num_chunks=4):
+    """
+    True overlap of matmul compute and all_reduce communication using chunking
+    and separate CUDA streams.
+
+    Pattern per chunk:
+      compute_stream:  C_i = A_i @ B
+      comm_stream:     wait for compute_stream(C_i), all_reduce(C_i)
+    """
+    device = torch.device(f"cuda:{rank}")
+
+    # Allocate A, B, and full C ahead of time
+    A = torch.randn(size, size, device=device)
+    B = torch.randn(size, size, device=device)
+    C = torch.empty(size, size, device=device)
+
+    # Two streams: one for compute, one for comm
+    compute_stream = torch.cuda.default_stream(device)
+    comm_stream = torch.cuda.Stream(device=device)
+
+    print(f"[Rank {rank}] Starting TRUE OVERLAP example...")
+    start = time.time()
+
+    chunk_size = size // num_chunks
+    handles = []
+
+    for i in range(num_chunks):
+        start_idx = i * chunk_size
+        end_idx = (i + 1) * chunk_size
+
+        A_chunk = A[start_idx:end_idx, :]
+        C_chunk = C[start_idx:end_idx, :]
+
+        # 1) Launch matmul for this chunk on compute_stream
+        with torch.cuda.stream(compute_stream):
+            # C_chunk = A_chunk @ B  (out= to avoid new allocation)
+            C_chunk[:] = torch.matmul(A_chunk, B)
+
+        # 2) On comm_stream, wait until this chunk's compute is done,
+        #    then launch async all_reduce for this chunk.
+        with torch.cuda.stream(comm_stream):
+            # this makes comm_stream see all work in compute_stream up to now
+            comm_stream.wait_stream(compute_stream)
+
+            handle = dist.all_reduce(C_chunk, op=dist.ReduceOp.SUM, async_op=True)
+            handles.append(handle)
+
+        # 3) Loop continues: next iteration will enqueue compute for next chunk
+        #    on compute_stream, which can overlap with ongoing NCCL on comm_stream.
+
+    # Wait for all all_reduce ops to finish
+    for h in handles:
+        h.wait()
+
+    # Optional: synchronize both streams before measuring end time
+    torch.cuda.synchronize(device)
+
+    end = time.time()
+    print(f"[Rank {rank}] TRUE OVERLAP completed in {end - start:.3f}s")
+
+    return C
+
+# ============================================================================
+# Example 3: Another OVERLAP pattern - Pipeline style
+# ============================================================================
+def pipeline_overlap(rank, world_size, size=4096):
+    """
+    Pipeline-style overlap: compute -> start comm -> compute more while comm runs.
+    """
+    # setup() was already called in main()
+
+    A = torch.randn(size, size, device=f'cuda:{rank}')
+    B = torch.randn(size, size, device=f'cuda:{rank}')
+    X = torch.randn(size, size, device=f'cuda:{rank}')
+    
+    print(f"[Rank {rank}] Starting PIPELINE OVERLAP example...")
+    start = time.time()
+    
+    # First computation
+    C = torch.matmul(A, B)
+    
+    # Start async communication (non-blocking!)
+    handle = dist.all_reduce(C, op=dist.ReduceOp.SUM, async_op=True)
+    
+    # While C is being communicated, do MORE computation!
+    print(f"[Rank {rank}] Computing additional work while communicating...")
+    D = torch.matmul(X, X)  # This overlaps with the all_reduce!
+    D = torch.matmul(D, D)  # More work...
+    
+    # Wait for communication to finish
+    handle.wait()
     torch.cuda.synchronize()
-    start_time = time.time()
     
-    # ===== STEP 1: Fire matmul (a) using FlashAttention =====
-    print(f"[{time.time()-start_time:.4f}s] Firing matmul (a) - FlashAttention...")
-    with torch.cuda.stream(default_stream):
-        result_a = flash_attention_matmul(q_a, k_a, v_a)
+    end = time.time()
+    print(f"[Rank {rank}] PIPELINE OVERLAP completed in {end-start:.3f}s")
+
+
+# ============================================================================
+# Main execution function
+# ============================================================================
+def main():
+    """
+    To run this code, use torchrun:
     
-    # Wait for matmul (a) to complete
-    default_stream.synchronize()
-    time_a_finish = time.time()
-    print(f"[{time_a_finish-start_time:.4f}s] Matmul (a) completed")
-    
-    # ===== STEP 2: Fire matmul (b) and all-reduce in parallel =====
-    print(f"[{time.time()-start_time:.4f}s] Firing matmul (b) and all-reduce in parallel...")
-    
-    # Create tensors for matmul (b)
-    x_b = torch.randn(batch_size, seq_len, hidden_dim, device=device, dtype=torch.float16)
-    w_b = torch.randn(hidden_dim, hidden_dim, device=device, dtype=torch.float16)
-    
-    # Create tensor for all-reduce
-    allreduce_tensor = torch.randn(1024, 1024, device=device, dtype=torch.float16)
-    
-    # Fire matmul (b) in matmul_stream
-    with torch.cuda.stream(matmul_stream):
-        result_b = torch.matmul(x_b, w_b)
-    
-    # Fire all-reduce in allreduce_stream (only if world_size > 1)
-    if world_size > 1:
-        with torch.cuda.stream(allreduce_stream):
-            dist.all_reduce(allreduce_tensor, op=dist.ReduceOp.SUM)
-            allreduce_tensor = allreduce_tensor / world_size  # Average
-    else:
-        # Simulate all-reduce with a dummy operation
-        with torch.cuda.stream(allreduce_stream):
-            # Just do some computation to simulate all-reduce
-            allreduce_tensor = allreduce_tensor * 2.0
-    
-    # Wait for both to complete
-    matmul_stream.synchronize()
-    allreduce_stream.synchronize()
-    
-    end_time = time.time()
-    print(f"[{end_time-start_time:.4f}s] Matmul (b) and all-reduce completed")
+    torchrun --nproc_per_node=2 this_script.py
+    """
+    # 1. Initialize process group + set device
+    rank, world_size = setup()
     
     print(f"\n{'='*60}")
-    print(f"Total execution time: {end_time-start_time:.4f}s")
-    print(f"Time for matmul (a): {time_a_finish-start_time:.4f}s")
-    print(f"Time for matmul (b) + all-reduce: {end_time-time_a_finish:.4f}s")
+    print(f"Running on Rank {rank} of {world_size}")
     print(f"{'='*60}\n")
     
-    # Cleanup
-    if world_size > 1:
-        dist.destroy_process_group()
+    # 2. Run the examples (process group already initialized)
+    #no_overlap_matmul(rank, world_size, size=4096)
+    overlap_matmul(rank, world_size, size=4096, num_chunks=4)
+    # pipeline_overlap(rank, world_size, size=4096)
+    
+    # 3. Clean up
+    cleanup()
+
 
 if __name__ == "__main__":
     main()
-
