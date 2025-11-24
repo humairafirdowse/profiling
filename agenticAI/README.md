@@ -19,6 +19,11 @@ An AI-powered coding agent with comprehensive tool support, LLM integration (Ope
 │ - OpenAI     │  │ - FileTools  │  │ - Client     │
 │ - Gemini     │  │ - CodeTools  │  │ - Server     │
 │ - Factory    │  │ - SearchTools│  │ - Protocol   │
+│              │  │ - Profiling  │  │              │
+│              │  │   Tools      │  │              │
+│              │  │   * nsys     │  │              │
+│              │  │   * SQLite    │  │              │
+│              │  │   * Analysis  │  │              │
 └──────────────┘  └──────────────┘  └──────────────┘
         │                 │
         └─────────┬───────┘
@@ -42,6 +47,9 @@ An AI-powered coding agent with comprehensive tool support, LLM integration (Ope
 - **FileTools**: Read, write, edit, list, delete files
 - **CodeTools**: Search code, analyze structure
 - **SearchTools**: Semantic search, find files
+- **ProfilingTools**: GPU profiling with nsys, SQLite analysis, bottleneck detection
+  - `profile_with_nsys`: Run scripts with NVIDIA Nsight Systems profiling
+  - `analyze_nsys_sqlite`: Analyze SQLite databases for computation/communication bottlenecks
 - Extensible tool registry system
 
 ### 3. **LLM Integration** (`llm/`)
@@ -66,7 +74,12 @@ An AI-powered coding agent with comprehensive tool support, LLM integration (Ope
 pip install -r requirements.txt
 ```
 
-2. Set up environment variables (create `.env` file):
+2. **For GPU Profiling (optional):** Install NVIDIA Nsight Systems:
+   - Download from: https://developer.nvidia.com/nsight-systems
+   - Or install via package manager (e.g., `apt install nsight-systems` on Ubuntu)
+   - Verify installation: `nsys --version`
+
+3. Set up environment variables (create `.env` file):
 ```env
 # LLM Configuration
 LLM_PROVIDER=openai  # or "gemini"
@@ -165,6 +178,17 @@ result = await agent.run("Use MCP tools to accomplish task")
 - `semantic_search`: Semantic code search
 - `find_files`: Find files by glob pattern
 
+### Profiling Operations
+- `profile_with_nsys`: Run a Python script with nsys profiling and convert to SQLite
+- `analyze_nsys_sqlite`: Analyze nsys SQLite database for bottlenecks and optimization opportunities
+
+`profile_with_nsys` launcher options:
+- `launcher`: choose `python`, `torchrun`, or provide a full custom command
+- `nproc_per_node`: world size for `torchrun` (defaults to 1)
+- `launcher_args`: extra launcher flags (e.g., `--standalone`)
+- `cuda_visible_devices`: pin profiling to specific GPUs (e.g., `0,1`)
+- `env_vars`: JSON string of additional environment variables (e.g., `{"MASTER_PORT": "29999"}`)
+
 ## Configuration
 
 See `config.py` for all configuration options. Key settings:
@@ -195,6 +219,51 @@ LLM Response → ActionGenerator → Actions → ActionExecutor → Tool Registr
                                                                           Results
 ```
 
+### GPU Profiling Workflow
+
+The profiling tools enable end-to-end GPU performance analysis:
+
+```
+1. Profile Script
+   │
+   ├─→ Run script with nsys: profile_with_nsys(script_path)
+   │   │
+   │   ├─→ Execute: nsys profile --output script.nsys-rep torchrun --nproc_per_node=2 script.py
+   │   └─→ Convert: nsys export --type sqlite --output script.sqlite script.nsys-rep
+   │
+   ▼
+2. Analyze Database
+   │
+   └─→ Analyze SQLite: analyze_nsys_sqlite(sqlite_db_path)
+       │
+       ├─→ Query CUDA kernels (computation bottlenecks)
+       ├─→ Query NCCL operations (communication bottlenecks)
+       ├─→ Analyze overlap between compute and communication
+       └─→ Generate optimization suggestions
+```
+
+**Example Usage:**
+```python
+# Profile a distributed PyTorch script
+task = """
+Use profile_with_nsys to profile matmul_allreduce.py with:
+  launcher='torchrun'
+  nproc_per_node=2
+  launcher_args='--standalone'
+  cuda_visible_devices='0,1'
+  nsys_args='--trace=cuda,nvtx,osrt --force-overwrite=true'
+Then run analyze_nsys_sqlite on the generated SQLite DB to find
+compute/communication bottlenecks and overlap opportunities.
+"""
+
+result = await agent.run(task)
+# Agent will:
+# 1. Run nsys profiling
+# 2. Convert to SQLite
+# 3. Analyze for bottlenecks
+# 4. Provide optimization suggestions
+```
+
 ### MCP Integration
 
 The agent can:
@@ -207,6 +276,7 @@ The agent can:
 See `examples/` directory for:
 - `basic_usage.py`: Basic file operations
 - `with_mcp.py`: MCP integration example
+- `profile_matmul.py`: GPU profiling example with nsys and bottleneck analysis
 
 ## Development
 

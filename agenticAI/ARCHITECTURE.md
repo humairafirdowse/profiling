@@ -24,6 +24,10 @@ This document explains the architecture of the Coding Agent system.
 │ - OpenAI     │    │ - FileTools  │    │ - Client     │
 │ - Gemini     │    │ - CodeTools  │    │ - Server     │
 │ - Factory    │    │ - SearchTools│    │ - Protocol   │
+│              │    │ - Profiling  │    │              │
+│              │    │   Tools      │    │              │
+│              │    │   * nsys     │    │              │
+│              │    │   * SQLite   │    │              │
 └──────────────┘    └──────────────┘    └──────────────┘
         │                   │
         └─────────┬──────┘
@@ -76,9 +80,12 @@ ToolRegistry
     ├── CodeTools
     │   ├── SearchCodeTool
     │   └── AnalyzeCodeTool
-    └── SearchTools
-        ├── SemanticSearchTool
-        └── FindFilesTool
+    ├── SearchTools
+    │   ├── SemanticSearchTool
+    │   └── FindFilesTool
+    └── ProfilingTools
+        ├── ProfileWithNsysTool
+        └── AnalyzeNsysSqliteTool
 ```
 
 **Base Classes:**
@@ -221,7 +228,8 @@ Tool.execute(**params)
     │
     ├─→ File Operations (read, write, edit)
     ├─→ Code Operations (search, analyze)
-    └─→ Search Operations (semantic, find)
+    ├─→ Search Operations (semantic, find)
+    └─→ Profiling Operations (nsys profiling, SQLite analysis)
     │
     ▼
 Result: {"success": bool, "result": Any, "error": str}

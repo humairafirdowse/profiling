@@ -11,6 +11,7 @@ from .tools.base import ToolRegistry
 from .tools.file_tools import FileTools
 from .tools.code_tools import CodeTools
 from .tools.search_tools import SearchTools
+from .tools.profiling_tools import ProfilingTools
 from .llm.factory import create_llm_provider
 from .llm.base import LLMProvider
 from .actions.generator import ActionGenerator
@@ -62,6 +63,7 @@ class CodingAgent:
         FileTools.register_all(self.tool_registry, str(self.workspace_path))
         CodeTools.register_all(self.tool_registry, str(self.workspace_path))
         SearchTools.register_all(self.tool_registry, str(self.workspace_path))
+        ProfilingTools.register_all(self.tool_registry, str(self.workspace_path))
     
     def get_system_prompt(self) -> str:
         """Get the system prompt for the agent"""

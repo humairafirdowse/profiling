@@ -92,8 +92,8 @@ async def main():
         return
     
     await example_basic_task()
-    await example_code_analysis()
-    await example_search_and_edit()
+    # await example_code_analysis()
+    # await example_search_and_edit()
     
     print("\n" + "=" * 60)
     print("All examples completed!")
